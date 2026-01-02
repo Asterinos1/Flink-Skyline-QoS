@@ -19,20 +19,38 @@ def generate_uniform_data(faker, dimensions, d_min=0, d_max=100):
     return [faker.random_int(min=d_min, max=d_max) for _ in range(dimensions)]
 
 def generate_correlated_data(faker, dimensions, d_min=0, d_max=100):
-    base = faker.random_int(min=d_min + 20, max=d_max - 20)
-    offset = int((d_max - d_min) * 0.1) # 10% of the domain
+    domain_range = d_max - d_min
+    margin = int(domain_range * 0.1)
+
+    safe_min = d_min + margin
+    safe_max = d_max - margin
+    
+    
+    if safe_min >= safe_max:
+        safe_min, safe_max = d_min, d_max
+
+    base = faker.random_int(min=safe_min, max=safe_max)
+
+    offset_limit = int(domain_range * 0.1)
+    # Minimum offset 1
+    offset_limit = max(1, offset_limit)
     # Dimensions move together within a small range of the base
-    return [base + faker.random_int(min=-offset, max=offset) for _ in range(dimensions)]
+    return [base + faker.random_int(min=-offset_limit, max=offset_limit) for _ in range(dimensions)]
 
 def generate_anti_correlated_data(faker, dimensions, d_min=0, d_max=100):
-    # One dimension is very low, others are pushed high
-    pivot = faker.random_int(min=0, max=dimensions - 1)
-    low_bound = d_min + int((d_max - d_min) * 0.2)
-    high_bound = d_min + int((d_max - d_min) * 0.8)
-    return [faker.random_int(min=d_min, max=low_bound) if i == pivot 
-            else faker.random_int(min=high_bound, max=d_max) 
-            for i in range(dimensions)]
-
+    rand_vals = [faker.random.random() for _ in range(dimensions)]
+    target_sum = (d_min + d_max) / 2.0 * dimensions 
+    current_sum = sum(rand_vals)
+    scale = target_sum / current_sum if current_sum != 0 else 1
+    point = []
+    for v in rand_vals:
+        val = v * scale
+        noise = faker.random_int(min=int(-(d_max-d_min)*0.1), max=int((d_max-d_min)*0.1))
+        val += noise
+        val = max(d_min, min(d_max, int(val)))
+        point.append(val)
+        
+    return point
 def generate_data():
     faker = Faker()
     kafka_nodes = "localhost:9092"
@@ -97,3 +115,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
