@@ -41,6 +41,8 @@ public class FlinkSkyline {
         final double domainMax = params.getDouble("domain", 1000.0);
         final int dims = params.getInt("dims", 2);
 
+        final int numPartitions = parallelism * 2; //this is what it says in the paper
+
         final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setParallelism(parallelism);
 
@@ -71,16 +73,16 @@ public class FlinkSkyline {
         switch (algo) {
             case "mr-dim":
                 // MR-Dim: Standard dimensional partitioning
-                partitioner = new PartitioningLogic.DimPartitioner(parallelism, domainMax);
+                partitioner = new PartitioningLogic.DimPartitioner(numPartitions, domainMax);
                 break;
             case "mr-grid":
                 // MR-Grid: Prune dominated grids FIRST [cite: 231]
                 processedData = rawData.filter(new PartitioningLogic.GridDominanceFilter(domainMax, dims));
-                partitioner = new PartitioningLogic.GridPartitioner(parallelism, domainMax, dims);
+                partitioner = new PartitioningLogic.GridPartitioner(numPartitions, domainMax, dims);
                 break;
             default:
                 // MR-Angle: Hyperspherical partitioning [cite: 191]
-                partitioner = new PartitioningLogic.AnglePartitioner(parallelism, dims);
+                partitioner = new PartitioningLogic.AnglePartitioner(numPartitions, dims);
                 break;
         }
 
@@ -95,7 +97,7 @@ public class FlinkSkyline {
                     public void flatMap(String queryId, Collector<Tuple3<Integer, String, Long>> out) {
                         long startTime = System.currentTimeMillis();
                         // Broadcast query to all partitions
-                        for (int i = 0; i < parallelism; i++) {
+                        for (int i = 0; i < numPartitions; i++) {
                             out.collect(new Tuple3<>(i, queryId, startTime));
                         }
                     }
@@ -111,7 +113,7 @@ public class FlinkSkyline {
         // 5. Global Aggregation (From Version 2 - Barrier Synchronization)
         DataStream<String> finalResults = localSkylines
                 .keyBy(t -> t.f0) // Key by Query ID
-                .process(new GlobalSkylineAggregator(parallelism)) // Pass parallelism for barrier
+                .process(new GlobalSkylineAggregator(numPartitions)) // Pass numPartitions for barrier. wait numPartitions answers
                 .name("GlobalReducer");
 
         // 6. Sink
@@ -167,6 +169,8 @@ public class FlinkSkyline {
             out.collect(new Tuple3<>(queryId, startTime, results));
         }
 
+
+        //BNL Algo?
         private void processBuffer() throws Exception {
             Iterable<ServiceTuple> stateIter = localSkylineState.get();
             List<ServiceTuple> currentSkyline = new ArrayList<>();
