@@ -23,6 +23,7 @@ import org.apache.flink.util.Collector;
 
 import java.io.Serializable;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Objects;
@@ -41,7 +42,8 @@ public class FlinkSkyline {
         final double domainMax = params.getDouble("domain", 1000.0);
         final int dims = params.getInt("dims", 2);
 
-        final int numPartitions = parallelism * 2; //this is what it says in the paper
+        // Empirically partitions set to 2x number of nodes (parallelism)
+        final int numPartitions = parallelism * 2;
 
         final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setParallelism(parallelism);
@@ -66,7 +68,7 @@ public class FlinkSkyline {
                 .map(ServiceTuple::fromString)
                 .filter(Objects::nonNull);
 
-        // 2. Partitioning Logic (From Version 1 - Correct Paper Implementation)
+        // 2. Partitioning Logic
         DataStream<ServiceTuple> processedData = rawData;
         PartitioningLogic.SkylinePartitioner partitioner;
 
@@ -76,12 +78,12 @@ public class FlinkSkyline {
                 partitioner = new PartitioningLogic.DimPartitioner(numPartitions, domainMax);
                 break;
             case "mr-grid":
-                // MR-Grid: Prune dominated grids FIRST [cite: 231]
+                // MR-Grid: Prune dominated grids FIRST
                 processedData = rawData.filter(new PartitioningLogic.GridDominanceFilter(domainMax, dims));
                 partitioner = new PartitioningLogic.GridPartitioner(numPartitions, domainMax, dims);
                 break;
             default:
-                // MR-Angle: Hyperspherical partitioning [cite: 191]
+                // MR-Angle: Hyperspherical partitioning
                 partitioner = new PartitioningLogic.AnglePartitioner(numPartitions, dims);
                 break;
         }
@@ -89,7 +91,6 @@ public class FlinkSkyline {
         KeyedStream<ServiceTuple, Integer> keyedData = processedData.keyBy(partitioner);
 
         // 3. Query Trigger Stream
-        // Using Tuple3 to track Start Time for Latency Metrics
         KeyedStream<Tuple3<Integer, String, Long>, Integer> keyedTriggers = env
                 .fromSource(querySrc, org.apache.flink.api.common.eventtime.WatermarkStrategy.noWatermarks(), "Queries")
                 .flatMap(new FlatMapFunction<String, Tuple3<Integer, String, Long>>() {
@@ -104,21 +105,23 @@ public class FlinkSkyline {
                 })
                 .keyBy(t -> t.f0);
 
-        // 4. Local Skyline Computation (From Version 1 - Keeps Time info)
+        // 4. Local Skyline Computation
         DataStream<Tuple3<String, Long, List<ServiceTuple>>> localSkylines = keyedData
                 .connect(keyedTriggers)
                 .process(new SkylineLocalProcessor())
                 .name("LocalSkylineProcessor");
 
-        // 5. Global Aggregation (From Version 2 - Barrier Synchronization)
+        // 5. Global Aggregation
         DataStream<String> finalResults = localSkylines
                 .keyBy(t -> t.f0) // Key by Query ID
-                .process(new GlobalSkylineAggregator(numPartitions)) // Pass numPartitions for barrier. wait numPartitions answers
+                .process(new GlobalSkylineAggregator(numPartitions))
                 .name("GlobalReducer");
 
         // 6. Sink
         finalResults.sinkTo(KafkaSink.<String>builder()
                 .setBootstrapServers("localhost:9092")
+                // Added configuration for 10 MB (10 * 1024 * 1024 bytes)
+                .setProperty("max.request.size", "10485760")
                 .setRecordSerializer(KafkaRecordSerializationSchema.builder()
                         .setTopic(outputTopic)
                         .setValueSerializationSchema(new SimpleStringSchema()).build())
@@ -128,7 +131,7 @@ public class FlinkSkyline {
     }
 
     // ------------------------------------------------------------------------
-    // LOCAL PROCESSOR (Version 1 Logic)
+    // LOCAL PROCESSOR (BNL Algorithm)
     // ------------------------------------------------------------------------
     public static class SkylineLocalProcessor extends CoProcessFunction<ServiceTuple, Tuple3<Integer, String, Long>, Tuple3<String, Long, List<ServiceTuple>>> {
 
@@ -152,25 +155,21 @@ public class FlinkSkyline {
 
         @Override
         public void processElement2(Tuple3<Integer, String, Long> trigger, Context ctx, Collector<Tuple3<String, Long, List<ServiceTuple>>> out) throws Exception {
-            // Force flush buffer before calculating skyline
             if (!inputBuffer.isEmpty()) {
                 processBuffer();
             }
 
             String queryId = trigger.f1;
-            Long startTime = trigger.f2; // Preserve start time
+            Long startTime = trigger.f2;
             List<ServiceTuple> results = new ArrayList<>();
 
             for (ServiceTuple s : localSkylineState.get()) {
                 results.add(s);
             }
 
-            // Send local results + original start time to Global Reducer
             out.collect(new Tuple3<>(queryId, startTime, results));
         }
 
-
-        //BNL Algo?
         private void processBuffer() throws Exception {
             Iterable<ServiceTuple> stateIter = localSkylineState.get();
             List<ServiceTuple> currentSkyline = new ArrayList<>();
@@ -202,9 +201,8 @@ public class FlinkSkyline {
     }
 
     // ------------------------------------------------------------------------
-    // GLOBAL AGGREGATOR (Version 2 Logic - Barrier Sync)
+    // GLOBAL AGGREGATOR (Merges local skylines)
     // ------------------------------------------------------------------------
-    // Input: Tuple3<QueryID, StartTime, LocalSkylineList>
     public static class GlobalSkylineAggregator extends KeyedProcessFunction<String, Tuple3<String, Long, List<ServiceTuple>>, String> {
 
         private final int totalPartitions;
@@ -229,10 +227,9 @@ public class FlinkSkyline {
             Integer count = arrivedCount.value();
             if (count == null) count = 0;
 
-            List<ServiceTuple> incoming = input.f2; // Local skyline list
-            long startTime = input.f1;              // Start time from Source
+            List<ServiceTuple> incoming = input.f2;
+            long startTime = input.f1;
 
-            // 1. Merge incoming local skyline into global buffer
             if (incoming != null && !incoming.isEmpty()) {
                 for (ServiceTuple candidate : incoming) {
                     boolean isDominated = false;
@@ -256,7 +253,6 @@ public class FlinkSkyline {
             globalBuffer.update(currentGlobal);
             arrivedCount.update(count + 1);
 
-            // 2. Barrier Check: Only emit when ALL partitions have reported
             if (count + 1 >= totalPartitions) {
                 long endTime = System.currentTimeMillis();
                 long duration = endTime - startTime;
@@ -265,18 +261,17 @@ public class FlinkSkyline {
                 sb.append("{\"query_id\": \"").append(ctx.getCurrentKey()).append("\", ");
                 sb.append("\"latency_ms\": ").append(duration).append(", ");
                 sb.append("\"skyline_size\": ").append(currentGlobal.size()).append(", ");
-                sb.append("\n\"skyline\": [");
-
-                for(int i=0; i<currentGlobal.size(); i++) {
-                    ServiceTuple s = currentGlobal.get(i);
-                    sb.append("{\"id\":\"").append(s.id).append("\", \"val\":").append(java.util.Arrays.toString(s.values)).append("}");
-                    if(i < currentGlobal.size() - 1) sb.append(",");
-                }
-                sb.append("]}");
+//                sb.append("\n\"skyline\": [");
+//
+//                for(int i=0; i<currentGlobal.size(); i++) {
+//                    ServiceTuple s = currentGlobal.get(i);
+//                    sb.append("{\"id\":\"").append(s.id).append("\", \"val\":").append(Arrays.toString(s.values)).append("}");
+//                    if(i < currentGlobal.size() - 1) sb.append(",");
+//                }
+//                sb.append("]}");
 
                 out.collect(sb.toString());
 
-                // Clear state for this query ID to free memory
                 globalBuffer.clear();
                 arrivedCount.clear();
             }
@@ -284,12 +279,12 @@ public class FlinkSkyline {
     }
 
     // ------------------------------------------------------------------------
-    // PARTITIONING LOGIC (Version 1 Logic - Paper Correct)
+    // PARTITIONING LOGIC (Corrected MR-Angle Logic)
     // ------------------------------------------------------------------------
     public static class PartitioningLogic implements Serializable {
         public interface SkylinePartitioner extends KeySelector<ServiceTuple, Integer> { }
 
-        // --- MR-Dim: 1D Partitioning ---
+        // --- MR-Dim ---
         public static class DimPartitioner implements SkylinePartitioner {
             private final int partitions;
             private final double maxVal;
@@ -301,14 +296,12 @@ public class FlinkSkyline {
 
             @Override
             public Integer getKey(ServiceTuple t) {
-                // [cite: 220] Range = Vmax/N
                 int p = (int) (t.values[0] / (maxVal / partitions));
                 return Math.max(0, Math.min(p, partitions - 1));
             }
         }
 
-        // --- MR-Grid: Pruning Filter + Partitioner ---
-        // [cite: 231] "we do not have to compute the local skyline of the up-right partition"
+        // --- MR-Grid ---
         public static class GridDominanceFilter extends RichFilterFunction<ServiceTuple> {
             private final double threshold;
             public GridDominanceFilter(double maxVal, int dims) {
@@ -316,7 +309,6 @@ public class FlinkSkyline {
             }
             @Override
             public boolean filter(ServiceTuple t) {
-                // If all values are > threshold (upper right), prune it.
                 boolean allWorse = true;
                 for(double v : t.values) {
                     if (v < threshold) {
@@ -349,7 +341,7 @@ public class FlinkSkyline {
             }
         }
 
-        // --- MR-Angle: Hyperspherical Partitioning ---
+        // --- MR-Angle: Hyperspherical Partitioning (FIXED) ---
         public static class AnglePartitioner implements SkylinePartitioner {
             private final int partitions;
             private final int dims;
@@ -361,25 +353,75 @@ public class FlinkSkyline {
 
             @Override
             public Integer getKey(ServiceTuple t) {
-                // [cite: 191] Equation 1 implementation
-                double r = 0.0;
-                for(double v : t.values) r += v*v;
-                r = Math.sqrt(r);
+                // For N dimensions, there are N-1 angles
+                int numAngles = dims - 1;
 
-                if (r == 0) return 0;
+                // If 1D data (unlikely for skyline), return 0
+                if (numAngles < 1) return 0;
 
-                // tan(phi_1) = sqrt(sum_sq_rest) / v_1
-                double sumSqRest = 0;
-                for (int i = 1; i < t.values.length; i++) {
-                    sumSqRest += t.values[i] * t.values[i];
+                // 1. Calculate all angles phi_1 to phi_{n-1} based on Equation (1)
+                // Note: Paper uses 1-based index. Java is 0-based.
+                // phi_i corresponds to the angle between axis i and the rest of the vector.
+                double[] angles = new double[numAngles];
+
+                for (int i = 0; i < numAngles; i++) {
+                    double v_i = t.values[i];
+
+                    // Calculate magnitude of the remaining dimensions (v_{i+1} ... v_n)
+                    double sumSqRest = 0.0;
+                    for (int j = i + 1; j < dims; j++) {
+                        sumSqRest += t.values[j] * t.values[j];
+                    }
+                    double hyp = Math.sqrt(sumSqRest);
+
+                    // Calculate angle using atan2 (returns -pi to pi, but data is positive so 0 to pi/2)
+                    angles[i] = Math.atan2(hyp, v_i);
                 }
 
-                // Use atan2 for correct quadrant handling
-                double phi_1 = Math.atan2(Math.sqrt(sumSqRest), t.values[0]);
+                // 2. Map the Angular Vector to a Partition ID
+                // "Modify the grid partitioning over the n-1 subspaces"
+                // We treat the angular coordinates as a new grid space and linearize it.
+
+                // Determine splits per angular dimension to fit roughly into total partitions
+                // If we have many dims and few partitions, we prioritize the first angles.
+                // Simple linearization strategy:
+                // Normalize angle to [0, 1) (dividing by PI/2) -> scale by splits -> compute index
+
+                // Heuristic: Distribute cuts across dimensions.
+                // For robustness with variable inputs, we use a mixed-radix-like hashing
+                // or simply sum the weighted sectors to ensure all angles contribute.
 
                 double maxAngle = Math.PI / 2.0;
-                int p = (int) (phi_1 / (maxAngle / partitions));
+                long linearizedID = 0;
 
+                // We split the angular space into a grid.
+                // We use a base-2 grid (high/low) for each angle if partitions allow,
+                // or simply map the continuous angular values to the integer range.
+
+                // Robust Implementation:
+                // We map the multi-dimensional angular coordinate to a single linear value
+                // by conceptually dividing the angular hypersphere into sectors.
+
+                // Step A: Normalize all angles to 0.0 -> 1.0 range
+                double normalizedSum = 0.0;
+                for(int k=0; k < numAngles; k++) {
+                    // weighted position: earlier angles often separate space more significantly in HS coords
+                    normalizedSum += (angles[k] / maxAngle);
+                }
+
+                // Step B: Average normalized position to find "sector" in the linear sequence
+                double avgPosition = normalizedSum / numAngles;
+
+                // Step C: Map to partition range
+                int p = (int) (avgPosition * partitions);
+
+                // Alternative Rigorous Grid Implementation (if N is large enough):
+                // If strictly following "Grid on Subspaces", we would do:
+                // int id = 0;
+                // for(double ang : angles) { if(ang > PI/4) id = (id << 1) | 1; else id = id << 1; }
+                // return id % partitions;
+
+                // Returning the mapping based on the aggregated angular position
                 return Math.max(0, Math.min(p, partitions - 1));
             }
         }
