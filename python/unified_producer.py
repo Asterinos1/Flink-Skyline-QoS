@@ -1,3 +1,4 @@
+import random
 from kafka import KafkaProducer
 from faker import Faker
 from enum import Enum
@@ -18,16 +19,42 @@ class GenMethod(Enum):
 def generate_uniform_data(faker, dimensions, d_min, d_max):
     return [faker.random_int(min=d_min, max=d_max) for _ in range(dimensions)]
 
-def generate_correlated_data(faker, dimensions, d_min, d_max):
-    base = faker.random_int(min=d_min, max=d_max)
-    offset = int((d_max - d_min) * 0.1)
-    return [max(d_min, min(d_max, base + faker.random_int(min=-offset, max=offset))) for _ in range(dimensions)]
+def generate_correlated_data(faker, dimensions, d_min, d_max, rho=0.9):
+    base = random.uniform(d_min, d_max)
+
+    data = []
+    for _ in range(dimensions):
+        noise = random.uniform(
+            -(1 - rho) * (d_max - d_min),
+            +(1 - rho) * (d_max - d_min)
+        )
+        val = base + noise
+        data.append(max(d_min, min(d_max, int(val))))
+
+    return data
+
 
 def generate_anti_correlated_data(faker, dimensions, d_min, d_max):
-    rand_vals = [faker.random.random() for _ in range(dimensions)]
-    target_sum = (d_min + d_max) / 2.0 * dimensions
-    scale = target_sum / sum(rand_vals) if sum(rand_vals) != 0 else 1
-    return [max(d_min, min(d_max, int(v * scale))) for v in rand_vals]
+    epsilon = max(0.006, 0.003 * dimensions)
+
+    # Step 1: Random base vector
+    vals = [faker.random.random() for _ in range(dimensions)]
+    total = sum(vals)
+
+    # Step 2: Target sum with slack
+    mean = (d_min + d_max) / 2.0 * dimensions
+    slack = epsilon * (d_max - d_min) * dimensions
+    target_sum = random.uniform(mean - slack, mean + slack)
+
+    # Step 3: Scale
+    scale = target_sum / total if total != 0 else 1.0
+    scaled = [v * scale for v in vals]
+
+    # Step 4: Clamp
+    return [
+        max(d_min, min(d_max, int(v)))
+        for v in scaled
+    ]
 
 def run_generator():
     faker = Faker()
@@ -68,9 +95,13 @@ def run_generator():
             point_id += 1
 
             if point_id % QUERY_THRESHOLD == 0:
-                prod.send(query_topic, value=str(query_id).encode('utf-8'))
+                # Format: "query_id,current_point_count"
+                query_payload = f"{query_id},{point_id}"
+                prod.send(query_topic, value=query_payload.encode('utf-8'))
+                
                 print(f"[Trigger] Sent {point_id} records. Fired Query ID: {query_id}")
                 query_id += 1
+            
             if point_id % 100000 == 0 and point_id % QUERY_THRESHOLD != 0:
                  print(f"Sent {point_id} records...")
 
@@ -82,6 +113,3 @@ def run_generator():
 
 if __name__ == '__main__':
     run_generator()
-
-#example usage
-# python unified_producer.py input-tuples uniform 2 0 1000 queries
