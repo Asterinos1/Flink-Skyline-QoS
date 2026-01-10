@@ -35,7 +35,16 @@ def generate_correlated_data(faker, dimensions, d_min, d_max, rho=0.9):
 
 
 def generate_anti_correlated_data(faker, dimensions, d_min, d_max):
-    epsilon = max(0.006, 0.003 * dimensions)
+    epsilon = 0.0005 #needs to be higher for higher dimensions(0.005 for 2 dimensions)
+
+    if dimensions == 2:
+        epsilon = 0.0005
+    elif dimensions == 3:
+        epsilon = 0.05    # 100x thicker than 
+    elif dimensions == 4:
+        epsilon = 0.9    # 100x thicker than 2D   
+    else:
+        epsilon = dimensions * 0.005 * 100
 
     # Step 1: Random base vector
     vals = [faker.random.random() for _ in range(dimensions)]
