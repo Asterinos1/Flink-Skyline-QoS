@@ -1,6 +1,19 @@
 import matplotlib.pyplot as plt
 import numpy as np
 
+"""
+Paper Figure Replication Script.
+
+This script is designed to generate the final comparative figures for the academic paper
+or technical report. It focuses on two key metrics:
+- Processing Time vs. Dimensionality (Figure 5 replication)
+- Local Optimality vs. Dimensionality (Figure 7 replication)
+
+The script uses hardcoded dictionaries to store the final aggregated results from 
+the experiments. This allows for easy manual entry of data points gathered from 
+multiple Flink job runs without needing to parse dozens of raw CSV files dynamically.
+"""
+
 # ==========================================
 # ENTER YOUR RESULTS HERE
 # ==========================================
@@ -9,16 +22,19 @@ import numpy as np
 
 dimensions = [2, 4, 8]
 
-# Objective 2: Processing Time (Seconds)
-# Example Data (Replace with yours!)
+# Objective: Processing Time (Seconds)
+# Enter the total processing time derived from the Flink job results.
+# Ensure consistency in the record count used (e.g., all data points for 1M records).
 time_results = {
     "MR-Dim":   [19544, 27264, 716996],  # Times for Dim 2, 4, 8
     "MR-Grid":  [17593, 26601, 691882],
     "MR-Angle": [17282, 27015,  766937]
 }
 
-# Objective 3: Local Optimality (0.0 - 1.0)
-# Example Data (Replace with yours!)
+# Objective: Local Optimality (0.0 - 1.0)
+# Enter the optimality ratio calculated by the Global Aggregator.
+# A value of 1.0 means perfect local pruning (no false positives sent to reducer).
+# A value near 0.0 means poor pruning (many dominated points sent to reducer).
 optimality_results = {
     "MR-Dim":   [0.7379, 0.6742, 0.25],
     "MR-Grid":  [0.5415, 0.5906, 0.25],
@@ -26,6 +42,24 @@ optimality_results = {
 }
 # ==========================================
 
+"""
+Generates and saves the publication-ready figures.
+
+This function creates two separate line charts using the data dictionaries defined above.
+
+The first plot visualizes how the Processing Time scales as dimensionality increases.
+It typically reveals the "Curse of Dimensionality," where higher dimensions lead to
+exponentially longer processing times due to the difficulty of dominance checks.
+
+The second plot visualizes the Local Optimality ratio. This metric assesses the efficiency
+of the partitioning strategy. Effective partitioners (like MR-Angle on anti-correlated data)
+maintain high optimality scores even in higher dimensions, whereas weaker strategies 
+tend to degrade toward zero.
+
+Outputs:
+- figure_5_replication.png (Time Analysis)
+- figure_7_replication.png (Optimality Analysis)
+"""
 def plot_paper_figures():
     # --- Figure 5 Replication (Time vs Dim) ---
     plt.figure(figsize=(10, 5))
