@@ -3,6 +3,43 @@ import matplotlib.pyplot as plt
 import sys
 import os
 
+"""
+Flink Skyline Performance Analysis Script.
+
+This tool generates a comprehensive 2x2 dashboard visualization of the Flink job's performance.
+It is designed to compare multiple algorithms (e.g., MR-Angle vs. MR-Dim) or configurations 
+side-by-side.
+
+The script produces four distinct subplots to evaluate different system characteristics:
+- Ingestion Time: Tracks the raw speed of data uptake from Kafka.
+- Total Processing Time: Measures the end-to-end latency (Scalability).
+- Optimality Ratio: visualizes the efficiency of the pruning strategy over time.
+- Time Breakdown: A bar chart showing the split between Local and Global processing time 
+  for the final data batch.
+
+This dashboard is useful for identifying bottlenecks (e.g., high global merge times) and 
+verifying that the system scales linearly with data volume.
+"""
+
+"""
+Generates the performance dashboard.
+
+The function iterates through the provided file mapping (Label -> CSV Path). For each file, 
+it loads the data, sorts it by record count to ensure monotonic lines, and plots the 
+relevant metrics onto the subplot grid.
+
+The 'Ingestion Time' and 'Total Processing Time' plots use line graphs to show trends 
+as data volume increases. The 'Optimality' plot uses a dashed line to highlight stability 
+or degradation in pruning power. Finally, the 'Time Breakdown' uses a stacked bar chart 
+to visualize the contribution of local vs. global processing for the largest dataset size.
+
+Inputs:
+- file_map: A dictionary mapping a display label (e.g., "MR-Angle") to a CSV filepath.
+
+Outputs:
+- Saves a high-resolution image 'performance_analysis.png'.
+- Displays the interactive plot window.
+"""
 def plot_performance(file_map):
     # Setup Figure with 2x2 Subplots
     fig, axes = plt.subplots(2, 2, figsize=(15, 10))
@@ -28,19 +65,19 @@ def plot_performance(file_map):
             # X-Axis: Millions of Records
             x = df["Records"] / 1_000_000
 
-            # 1. Ingestion Time (Objective 4)
+            # Ingestion Time (Objective 4)
             # Plotting raw ingestion time per query batch
             ax_ingest.plot(x, df["IngestTime(ms)"], marker='.', label=label)
             
-            # 2. Total Processing Time (Objective 2 & 5)
+            # Total Processing Time (Objective 2 & 5)
             # Convert to Seconds for readability
             ax_total.plot(x, df["TotalTime(ms)"] / 1000, marker='o', label=label)
 
-            # 3. Optimality Evolution (Objective 3)
+            # Optimality Evolution (Objective 3)
             ax_optimality.plot(x, df["Optimality"], marker='x', linestyle='--', label=label)
 
-            # 4. Processing Breakdown (Last Record Only - Summary)
-            # We take the breakdown of the FINAL point in the stream
+            # Processing Breakdown (Summary)
+            # We take the breakdown of the FINAL point in the stream to represent steady-state behavior
             last_row = df.iloc[-1]
             ax_breakdown.bar(label, last_row["LocalTime(ms)"], label='Local CPU' if label==list(file_map.keys())[0] else "", color='skyblue')
             ax_breakdown.bar(label, last_row["GlobalTime(ms)"], bottom=last_row["LocalTime(ms)"], label='Global Merge' if label==list(file_map.keys())[0] else "", color='orange')
